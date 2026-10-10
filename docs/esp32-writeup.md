@@ -117,9 +117,11 @@ Computed from SRAM instead of flash, the head takes 28.9 ms on one core and
 29.3 ms, 1.57x, because each ESP32 core has its own flash cache, so two cores
 actually read flash 14% faster together than one alone.
 
-**Two corrections** to numbers I posted earlier: a token reads 741 KB, not
-0.9 MB, so the floor is 31 ms, not 45 ms. And splitting the head across two cores
-gave 1.57x, not 2x; my first comparison had a different kernel on each side.
+**Corrections** to numbers I posted earlier: a token reads 741 KB, not 0.9 MB.
+My first flash test also under-read the bandwidth (about 20 MB/s; the fixed test
+reads 23.7 MB/s), so the floor is 31 ms, not 37 ms. And splitting the head across
+two cores gave 1.57x, not 2x; my first comparison had a different kernel on each
+side.
 
 ## What the Arm port showed so far
 
