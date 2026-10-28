@@ -60,3 +60,4 @@ Thumbs.db
 # ---------------------------------------------------------------- local scratch
 *.log
 *.zip
+*:Zone.Identifier
