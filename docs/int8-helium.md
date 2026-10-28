@@ -150,6 +150,8 @@ Corstone-300 (version 11.27), give the same answer as in QEMU:
 | Hash of all 51 x 8192 logits | `0xe5f66a1b` | `0xe5f66a1b` |
 | Output head, FVP cycle counter | 463,283 | 4,950,400 |
 | Output head, QEMU instructions | 463,277 | 4,950,394 |
+| Helium instructions per token, FVP PMU and QEMU | 389,411 (both) | 2 (both) |
+| Helium instructions in the output head, FVP PMU and QEMU | 241,677 (both) | 0 |
 | Whole run, FVP instructions | 92.8M | 524.8M |
 
 - **Two independent models of the Cortex-M55 agree on every bit.** QEMU and Arm's
@@ -159,6 +161,10 @@ Corstone-300 (version 11.27), give the same answer as in QEMU:
   cycle-accurate, so its cycle count equals the instruction count. It matches QEMU's
   count for the output head to within 6 instructions; the difference is the
   measurement code around the region.
+- **Helium instructions, counted two ways, agree exactly.** The FVP counts them with
+  the Cortex-M55's own performance counter (`MVE_INST_RETIRED`), QEMU by decoding each
+  instruction. Both give 389,411 per token: 31% of the Helium kernel's 1.26M
+  instructions, and 52% of the output head's.
 - **The whole run** includes the kernel check and hashing the logits. Helium runs it
   in 5.7x fewer instructions than the plain C kernel.
 

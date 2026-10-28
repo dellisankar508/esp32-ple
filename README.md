@@ -174,9 +174,9 @@ Output goes through semihosting. Each run prints:
 - `GOLDEN`: the greedy decode against `golden_i8.txt`
 - `LOGITS`: a hash of every logit of that decode. Two kernels with the same hash on
   the same core produced a bit-identical run of the whole model.
-- `PMU` (FVP): instructions, Helium instructions and cycles per token, from the
-  Cortex-M55's performance monitor. The FVP isn't cycle-accurate: its cycle counter
-  advances one per instruction.
+- `PMU` (FVP): cycles and Helium instructions per token, from the Cortex-M55's
+  performance monitor. The FVP isn't cycle-accurate: its cycle counter advances one
+  per instruction, so there it is the instruction count.
 
 ```
 cd platform/corstone300
@@ -195,8 +195,9 @@ library (`libpython3.9.so.1.0`): if it's missing, use the one in the FVP's own
 their numbers compare kernels by instructions; they are not timings.
 
 Instructions per token in QEMU (51-token golden decode, 4.4M-parameter model). Arm's
-FVP prints the same logits hash for `mve` and `i8ref` (`0xe5f66a1b`) and the same
-instruction count for the output head, to within 6 instructions:
+FVP prints the same logits hash for `mve` and `i8ref` (`0xe5f66a1b`), the same
+instruction count for the output head to within 6 instructions, and exactly the same
+Helium instruction counts (389,411 per token):
 
 | Core | Kernel | Instructions / token | In the kernel | Golden |
 | --- | --- | --- | --- | --- |

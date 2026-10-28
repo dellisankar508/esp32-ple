@@ -8,7 +8,9 @@
  *   kernel=LO:HI            addresses [LO, HI) count as "kernel" instructions
  * Per region it prints: runs, instructions, kernel instructions, Helium (MVE)
  * instructions. MVE is recognised by encoding: T32 Advanced-SIMD-like space
- * (0xEF/0xFF first halfword) or coprocessor space with coprocessor 14/15.
+ * (0xEF/0xFF first halfword), coprocessor space with coprocessor 14/15, and the
+ * core-register transfers VMOV (to or from a vector lane) and VDUP. This matches the
+ * Cortex-M55's MVE_INST_RETIRED count on Arm's Corstone-300 FVP exactly.
  *
  * Build (QEMU's include/qemu/qemu-plugin.h, same version as qemu-system-arm):
  *   gcc -shared -fPIC -O2 -I<qemu>/include/qemu $(pkg-config --cflags glib-2.0) \
@@ -38,6 +40,7 @@ static int is_mve(const struct qemu_plugin_insn *insn) {
     uint16_t h1 = (uint16_t)(b[0] | b[1] << 8), h2 = (uint16_t)(b[2] | b[3] << 8);
     if ((h1 & 0xEF00) == 0xEF00) return 1;                            // vector data-processing
     if ((h1 & 0xEC00) == 0xEC00 && ((h2 >> 9) & 7) == 7) return 1;     // cp14/15: loads, MLADAV, ...
+    if ((h1 & 0xFF00) == 0xEE00 && (h2 & 0x0F1F) == 0x0B10) return 1;  // VMOV to/from a lane, VDUP
     return 0;
 }
 
