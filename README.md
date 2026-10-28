@@ -8,8 +8,8 @@ token for token.
 | Target | Core | Result |
 | --- | --- | --- |
 | ESP32-D0WD | Xtensa LX6, 2x 240 MHz, no PSRAM, no SIMD | 63.0 ms/token, 15.9 tok/s, golden MATCH |
-| Raspberry Pi Pico 2 W | Arm Cortex-M33, 2x 150 MHz | 77.7 ms/token, 12.9 tok/s with the DMA-streamed head (126.6 ms, 7.9 tok/s without), golden MATCH |
-| Corstone-300 FVP | Arm Cortex-M55 + Helium (simulated) | next: Helium kernel, instruction counts |
+| Raspberry Pi Pico 2 W | Arm Cortex-M33, 2x 150 MHz | **40.1 ms/token, 25.0 tok/s**: int8 DSP kernel, DMA-streamed head, flash at 75 MHz (v0.1.0 float kernel: 77.7 ms, 12.9 tok/s); kernel bit-exact on the chip, golden MATCH |
+| Corstone-300 (Cortex-M55 + Helium) | simulated: QEMU `mps3-an547` now, Arm's FVP next | int8 Helium kernel bit-exact; 1.26M instructions per token, 7.7x fewer than the float kernel (QEMU counts, not timings) |
 
 **How it fits:**
 
@@ -23,9 +23,16 @@ token for token.
 - **int8 KV cache** with a scale per head: 128 tokens of context in 147 KB.
 - **On the Pico 2 W, DMA streams the output head** from flash into SRAM while both
   cores compute, which took it from 7.9 to 12.9 tok/s.
+- **int8 activations, bit-exact everywhere** (new): the inputs of every matvec are
+  quantized to int8 per 32 values, so Arm's integer SIMD can do the math. The int8
+  path is defined down to the last rounding step, so the plain C, the Cortex-M33 DSP
+  and the Helium kernels all produce the numpy reference's exact bits. It costs
+  almost nothing (98.9% top-1 agreement with float, perplexity 5.013 -> 5.019), and
+  took the Pico 2 W from 12.9 to 19.3 tok/s; flash at 75 MHz then took it to 25.0.
 
 The full story, with the measurements behind each decision:
-[docs/esp32-writeup.md](docs/esp32-writeup.md).
+[docs/esp32-writeup.md](docs/esp32-writeup.md). The int8, DSP and Helium kernels:
+[docs/int8-helium.md](docs/int8-helium.md).
 
 Inspired by [slvDev/esp32-ai](https://github.com/slvDev/esp32-ai).
 
@@ -34,12 +41,17 @@ Inspired by [slvDev/esp32-ai](https://github.com/slvDev/esp32-ai).
 ```
 core/       ple.c (model), tokenizer.c, bench.c (one measurement method for all targets),
             head_stream.c (output head streamed through SRAM buffers by a platform mover)
-kernels/    kern.h (the matvec interface), scalar.c (int4 x float, the ESP32 kernel)
-platform/   esp32/ (ESP-IDF + OLED demo), pico2/ (Pico SDK, dma_head.c = the DMA mover)
+            kern_check.c (a kernel against numpy test vectors, bit for bit)
+kernels/    kern.h (the matvec interface), scalar.c (int4 x float, the ESP32 kernel),
+            q8.h + i8ref.c (int8 activations, plain C), dsp.c (Cortex-M33 SMLAD), mve.c (Helium)
+platform/   esp32/ (ESP-IDF + OLED demo), pico2/ (Pico SDK, dma_head.c = the DMA mover),
+            corstone300/ (bare metal: Corstone-300 FVP or QEMU, Cortex-M55 and M33)
 host/       ple_host: same core on your PC; `make test` = golden check on a synthetic model
-train/      train_ple.py (PyTorch, TinyStories), export_ple.py (PLE1 int4 export + numpy reference)
-tools/      make_synthetic.py, ttf2font.py
-model/      your model.bin, tokenizer.bin, golden.txt (not committed)
+train/      train_ple.py (PyTorch, TinyStories), export_ple.py (PLE1 int4 export + numpy
+            reference, float or int8 activations)
+tools/      make_synthetic.py, kernel_vectors.py, act_quality.py, qemu_count/ (exact
+            instruction counts in QEMU), compare_logs.py, ttf2font.py
+model/      your model.bin, tokenizer.bin, golden.txt, golden_i8.txt, kvec.bin (not committed)
 ```
 
 ## 1. Model files
@@ -55,7 +67,14 @@ cp model.bin tokenizer.bin golden.txt model/
 ```
 
 `--check` runs the numpy int4 reference, which models the int8 KV cache exactly
-as `core/ple.c` does, and writes `golden.txt`.
+as `core/ple.c` does, and writes `golden.txt` (float activations) and `golden_i8.txt`
+(int8 activations). For the int8 kernels you also need the kernel test vectors.
+Both work from `model.bin` alone, numpy only:
+
+```
+python train/export_ple.py --regolden model --act i8      # golden_i8.txt
+python tools/kernel_vectors.py model/model.bin model/kvec.bin
+```
 
 ## 2. Host check
 
@@ -65,6 +84,8 @@ make test        # synthetic model: GOLDEN: MATCH on 1 and 2 threads, plain and 
 make tsan        # the same under ThreadSanitizer (checks the streamed-head hand-off)
 make run         # your model/ files
 make story
+make test KERNEL=i8ref   # int8 activations, checked against golden_i8.txt
+make ktest KERNEL=i8ref  # the kernel alone vs numpy, every output bit for bit
 ```
 
 On the host, "2 cores" are two threads, and the streamed head runs with a fake
@@ -97,7 +118,19 @@ export PICO_SDK_PATH=$PWD/pico-sdk
 
 cmake -S platform/pico2 -B build-pico          # -DPICO_BOARD=pico2 for the non-W board
 cmake --build build-pico -j
+
+# int8 activations with the Cortex-M33 DSP kernel (needs golden_i8.txt and kvec.bin):
+cmake -S platform/pico2 -B build-pico-dsp -DPLE_KERNEL=dsp
+cmake --build build-pico-dsp -j
 ```
+
+With an int8 kernel (`dsp` or `i8ref`), boot first checks the kernel against the
+numpy test vectors on the chip (`KERNEL | dsp | BITEXACT 42/42 cases`).
+
+The flash runs at the Pico SDK's setting for this board, sys/2 = 75 MHz, instead of
+the boot ROM's sys/3 = 50 MHz (`PLE_FAST_FLASH`, on by default; measured 20.5 -> 27.8
+MB/s). The `ENV` and `FLASH` lines show what you got, and the `MODEL` checksum shows
+the reads are correct. `-DPLE_FAST_FLASH=OFF` keeps the boot ROM's 50 MHz.
 
 The first configure builds picotool from source (about a minute). Then hold
 BOOTSEL, plug in USB, and copy `build-pico/ple_pico2.uf2` to the RP2350 drive.
@@ -131,6 +164,44 @@ the DMA head: the stream engine moves the head at 22.8 MB/s (the CPU reads 20.5)
 the head drops from 70.9 to 22.0 ms (pure compute is 20.9), and a token from
 126.6 to 77.7 ms.
 
+## 5. Cortex-M55 + Helium: Corstone-300 FVP (or QEMU)
+
+`platform/corstone300` is a bare-metal build for Arm's Corstone-300 (Cortex-M55 with
+Helium). It runs on Arm's free Fixed Virtual Platform, and on QEMU's `mps3-an547`.
+Output goes through semihosting. Each run prints:
+
+- `KERNEL`: the kernel against the numpy test vectors, every output bit for bit
+- `GOLDEN`: the greedy decode against `golden_i8.txt`
+- `LOGITS`: a hash of every logit of that decode. Two kernels with the same hash on
+  the same core produced a bit-identical run of the whole model.
+- `PMU` (FVP): instructions, Helium instructions and cycles per token, from the
+  Cortex-M55's performance monitor
+
+```
+cd platform/corstone300
+make KERNEL=mve                 # also: i8ref (plain C int8), scalar (float)
+make fvp KERNEL=mve             # FVP_Corstone_SSE-300_Ethos-U55 on your PATH
+make qemu KERNEL=mve            # or QEMU (apt install qemu-system-arm)
+make count KERNEL=mve           # exact instruction counts in QEMU (tools/qemu_count)
+make qemu KERNEL=dsp BOARD=an505   # the Pico's M33 kernel, on QEMU's Cortex-M33
+```
+
+Needs `arm-none-eabi-gcc` 13 or newer with newlib. Get the FVP from Arm's
+[Ecosystem FVPs](https://developer.arm.com/downloads/-/arm-ecosystem-fvps) page
+(Corstone-300, Linux; it runs in WSL). The FVP and QEMU are not cycle-accurate, so
+their numbers compare kernels by instructions; they are not timings.
+
+Instructions per token in QEMU (51-token golden decode, 4.4M-parameter model):
+
+| Core | Kernel | Instructions / token | In the kernel | Golden |
+| --- | --- | --- | --- | --- |
+| Cortex-M55 | `scalar` (float activations) | 9.76M | 9.34M | MATCH |
+| Cortex-M55 | `i8ref` (int8, plain C) | 8.48M | 8.05M | MATCH, bit-exact |
+| Cortex-M55 | `mve` (int8, Helium) | **1.26M** | **0.83M** | MATCH, bit-exact, same logits as `i8ref` |
+| Cortex-M33 | `scalar` | 9.92M | 9.37M | MATCH |
+| Cortex-M33 | `i8ref` | 9.05M | 8.51M | MATCH, bit-exact |
+| Cortex-M33 | `dsp` (int8, SMLAD) | **3.77M** | **3.23M** | MATCH, bit-exact, same logits as `i8ref` |
+
 ## The benchmark
 
 Every target runs the same `bench_run_all()` from `core/bench.c` at boot, so the
@@ -143,7 +214,8 @@ numbers compare like with like. It prints one tagged line per measurement:
 | `FLASH` | sequential read MB/s, random 216-byte row time |
 | `FLASH2` | the same bytes read by one core, then by both cores at once |
 | `FLOOR` | per-stage flash floor: the bytes a stage reads / sequential bandwidth |
-| `GOLDEN` | greedy decode matches `golden.txt`, over every run |
+| `KERNEL` | (int8 kernels) the kernel against the numpy test vectors in `kvec.bin`, bit for bit |
+| `GOLDEN` | greedy decode matches `golden.txt` (`golden_i8.txt` for int8 kernels), over every run |
 | `RESULT` | ms/token and the per-stage split, 1 core and 2 cores, median of 3 runs |
 | `HEADSRAM` | the output head with its weights copied to SRAM (pure compute), 1 vs 2 cores, next to the same head read from flash |
 | `RESULT ... +dma` | (Pico) the same runs with the DMA-streamed head, 1 and 2 cores, each with its own `GOLDEN` line |

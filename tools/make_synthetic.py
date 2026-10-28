@@ -1,7 +1,8 @@
 """
-Build a synthetic PLE1 model with random weights, plus a tokenizer.bin and a
-golden.txt from the numpy int4 reference. Lets `make test` check the C runtime
-end to end without the trained model or torch.
+Build a synthetic PLE1 model with random weights, plus a tokenizer.bin, golden.txt
+(float activations), golden_i8.txt (int8 activations) and kvec.bin (kernel test
+vectors). Lets `make test` and `make ktest` check the C runtime end to end without
+the trained model or torch.
 
     python tools/make_synthetic.py out_dir
 """
@@ -9,7 +10,9 @@ import os, struct, sys
 import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "train"))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import export_ple as E   # noqa: E402
+import kernel_vectors as KV  # noqa: E402
 
 out = sys.argv[1] if len(sys.argv) > 1 else "."
 os.makedirs(out, exist_ok=True)
@@ -35,9 +38,11 @@ for i in range(V):
     tok += struct.pack("<B", len(b)) + b
 open(os.path.join(out, "tokenizer.bin"), "wb").write(tok)
 
-ref = E.Ref(os.path.join(out, "model.bin"))
 ids = [5, 17, 300, 4000]
-gen = ref.greedy(ids, 40)
-with open(os.path.join(out, "golden.txt"), "w") as fh:
-    fh.write(" ".join(map(str, ids)) + "\n" + " ".join(map(str, gen[len(ids):])) + "\n")
-print(f"synthetic model, tokenizer and golden ({len(gen) - len(ids)} tokens) in {out}")
+for act in ("f32", "i8"):
+    gen = E.Ref(os.path.join(out, "model.bin"), act).greedy(ids, 40)
+    with open(os.path.join(out, E.golden_name(act)), "w") as fh:
+        fh.write(" ".join(map(str, ids)) + "\n" + " ".join(map(str, gen[len(ids):])) + "\n")
+sys.argv = ["kernel_vectors", os.path.join(out, "model.bin"), os.path.join(out, "kvec.bin")]
+KV.main()
+print(f"synthetic model, tokenizer, golden.txt, golden_i8.txt ({len(gen) - len(ids)} tokens) in {out}")

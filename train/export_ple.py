@@ -3,6 +3,8 @@ Export ple_d0wd96.pt -> model.bin (PLE1, int4 group-32) + tokenizer.bin + golden
 
     python export_ple.py                 # uses ple_d0wd96.pt + tokenizer.json in cwd
     python export_ple.py --check         # also runs a numpy reference forward on the exported file
+    python export_ple.py --regolden ../model             # numpy only: rewrite golden.txt
+    python export_ple.py --regolden ../model --act i8    # numpy only: write golden_i8.txt
 
 PLE1 binary layout (little-endian)
 ----------------------------------
@@ -60,6 +62,61 @@ def dequant_rows(buf: np.ndarray, out: int, inn: int) -> np.ndarray:
     q = np.empty((out, inn), np.int8); q[:, 0::2] = lo; q[:, 1::2] = hi
     scale = rows[:, inn // 2:inn // 2 + inn // 16].copy().view(np.float16).astype(np.float32)
     return (q.astype(np.float32).reshape(out, inn // GROUP, GROUP) * scale[..., None]).reshape(out, inn)
+
+
+def dequant_parts(buf: np.ndarray, out: int, inn: int):
+    """Like dequant_rows, but keeps the parts: int4 values as int8 [out, in] and the
+    fp16 group scales widened to float32 [out, in/32] (fp16 -> fp32 is exact)."""
+    row_bytes = align4(inn // 2 + inn // 16)
+    rows = buf.reshape(out, row_bytes)
+    packed = rows[:, :inn // 2]
+    lo = (packed & 0xF).astype(np.int8); hi = (packed >> 4).astype(np.int8)
+    lo = np.where(lo > 7, lo - 16, lo); hi = np.where(hi > 7, hi - 16, hi)
+    q = np.empty((out, inn), np.int8); q[:, 0::2] = lo; q[:, 1::2] = hi
+    scale = rows[:, inn // 2:inn // 2 + inn // 16].copy().view(np.float16).astype(np.float32)
+    return q, scale
+
+
+# ---------------------------------------------------------------- int8-activation matvec (I8 v1)
+# The contract every int8 kernel (kernels/i8ref.c, dsp.c, mve.c) must meet bit for bit.
+# For y = W x with W int4 group-32 (fp16 scales s) and x float32:
+#  1. per group g of 32 inputs: m = max|x|; m < 2^-60 -> sx = 0, q = 0 (see below);
+#     else inv = 127/m, sx = m/127, q = clamp(rint(x * inv), -127, 127)   (round half to even)
+#  2. per row r and group g: d = sum of w * q over the 32 columns, exact in int32
+#  3. y_r = (...((0 + d_0 * c_0) + d_1 * c_1) ...) with c_g = s_rg * sx_g, groups in order,
+#     every * and + rounded to float32, no fused multiply-add
+# Every step is float32 or exact integer math, so numpy and C agree to the last bit.
+# The 2^-60 cut-off keeps every product in step 3 a normal float (fp16 scales are at
+# least 2^-24), so vector units that flush subnormals to zero still agree exactly.
+F32 = np.float32
+
+
+def act_q8(x: np.ndarray):
+    """x [T, in] float32 -> q int8 [T, in], sx float32 [T, in/32]  (step 1)."""
+    T, inn = x.shape
+    g = x.astype(F32).reshape(T, inn // GROUP, GROUP)
+    m = np.abs(g).max(-1)
+    nz = m >= F32(2.0 ** -60)
+    inv = np.where(nz, F32(127) / np.where(nz, m, F32(1)), F32(0)).astype(F32)
+    sx = np.where(nz, m / F32(127), F32(0)).astype(F32)
+    q = np.clip(np.rint(g * inv[..., None]), -127, 127).astype(np.int8)
+    return q.reshape(T, inn), sx
+
+
+def matvec_i8(wq: np.ndarray, ws: np.ndarray, x: np.ndarray) -> np.ndarray:
+    """I8 v1 matvec for a batch of inputs. wq int8 [out, in], ws float32 [out, in/32],
+    x float32 [T, in] -> y float32 [T, out]."""
+    q, sx = act_q8(x)
+    T, inn = q.shape
+    ng = inn // GROUP
+    q = q.reshape(T, ng, GROUP).astype(np.int32)
+    w = wq.reshape(wq.shape[0], ng, GROUP).astype(np.int32)
+    acc = np.zeros((T, wq.shape[0]), F32)
+    for g in range(ng):                                   # groups in order, as in C
+        d = (q[:, g, :] @ w[:, g, :].T).astype(F32)       # exact int32 sums, then to float
+        c = (ws[None, :, g] * sx[:, g, None]).astype(F32)
+        acc = (acc + (d * c).astype(F32)).astype(F32)
+    return acc
 
 
 def align4(n):  return (n + 3) & ~3
@@ -138,8 +195,12 @@ def export_tokenizer(tok_json: str, out_path: str):
 
 # ---------------------------------------------------------------- numpy reference forward
 class Ref:
-    """Dequantized reference. Same math the C runtime must reproduce, int8 KV cache included."""
-    def __init__(self, path):
+    """Dequantized reference. Same math the C runtime must reproduce, int8 KV cache included.
+    act="f32": float activations, matching kernels/scalar.c.
+    act="i8":  int8 activations (I8 v1 above), matching kernels/i8ref.c, dsp.c and mve.c."""
+    def __init__(self, path, act="f32"):
+        assert act in ("f32", "i8")
+        self.act = act
         b = np.fromfile(path, np.uint8)
         assert b[:4].tobytes() == b"PLE1"
         (self.V, self.D, self.L, self.H, self.F, self.P, self.C, g) = struct.unpack_from("<8I", b, 8)
@@ -148,6 +209,7 @@ class Ref:
         V, D, L, F, P = self.V, self.D, self.L, self.F, self.P
         rb = lambda inn: align4(inn // 2 + inn // 16)
         self.tok = dequant_rows(b[ot:ot + V * rb(D)], V, D)
+        self.tok_i8 = dequant_parts(b[ot:ot + V * rb(D)], V, D) if act == "i8" else None
         self.ple = dequant_rows(b[op:op + V * rb(L * P)], V, L * P)
         self.layers = []
         o = ol
@@ -155,7 +217,10 @@ class Ref:
             lay = {}
             def mat(name, out, inn):
                 nonlocal o
-                n = out * rb(inn); lay[name] = dequant_rows(b[o:o + n], out, inn); o += n
+                n = out * rb(inn); lay[name] = dequant_rows(b[o:o + n], out, inn)
+                if act == "i8":
+                    lay[name + "_i8"] = dequant_parts(b[o:o + n], out, inn)
+                o += n
             def vec(name):
                 nonlocal o
                 lay[name] = b[o:o + 4 * D].view(np.float32).copy(); o += 4 * D
@@ -183,14 +248,20 @@ class Ref:
         x1, x2 = x[..., 0::2], x[..., 1::2]
         return np.stack([x1 * c - x2 * s, x1 * s + x2 * c], -1).reshape(x.shape)
 
+    def mv(self, lay, name, x):
+        """One weight matvec, through whichever kernel contract this reference models."""
+        if self.act == "i8":
+            return matvec_i8(*lay[name + "_i8"], x)
+        return x @ lay[name].T
+
     def logits(self, ids):
         T, D, H = len(ids), self.D, self.H
         hd = D // H
         h = self.tok[ids]
         pos = np.arange(T)
         for l, lay in enumerate(self.layers):
-            h = h + self.ple[ids][:, l * self.P:(l + 1) * self.P] @ lay["ple_proj"].T
-            qkv = self.rms(h, lay["n1"]) @ lay["qkv"].T
+            h = h + self.mv(lay, "ple_proj", self.ple[ids][:, l * self.P:(l + 1) * self.P])
+            qkv = self.mv(lay, "qkv", self.rms(h, lay["n1"]))
             q, k, v = (qkv[:, i * D:(i + 1) * D].reshape(T, H, hd) for i in range(3))
             q, k = self.rope(q, pos), self.rope(k, pos)
             k, v = self.q8(k), self.q8(v)                # int8 KV cache, as in core/ple.c
@@ -198,11 +269,14 @@ class Ref:
             att += np.triu(np.full((T, T), -1e9), 1)[None]
             att = np.exp(att - att.max(-1, keepdims=True)); att /= att.sum(-1, keepdims=True)
             a = np.einsum("hts,shd->thd", att, v).reshape(T, D)
-            h = h + a @ lay["o"].T
+            h = h + self.mv(lay, "o", a)
             x = self.rms(h, lay["n2"])
-            s = x @ lay["w1"].T
-            h = h + ((s / (1 + np.exp(-s))) * (x @ lay["w3"].T)) @ lay["w2"].T
-        return self.rms(h, self.norm) @ self.tok.T
+            s = self.mv(lay, "w1", x)
+            h = h + self.mv(lay, "w2", (s / (1 + np.exp(-s))) * self.mv(lay, "w3", x))
+        x = self.rms(h, self.norm)
+        if self.act == "i8":
+            return matvec_i8(*self.tok_i8, x)
+        return x @ self.tok.T
 
     def greedy(self, ids, n):
         ids = list(ids)
@@ -222,22 +296,35 @@ def decode_bin(tok_bin: str, ids):
     return b"".join(table[i] for i in ids).decode("utf-8", "replace")
 
 
-def regolden(model_dir: str, n_tokens: int):
-    """Rewrite golden.txt from an existing model.bin with the current reference.
-    Reuses the prompt ids already in golden.txt, so neither torch nor tokenizers is needed."""
-    mb, gt = os.path.join(model_dir, "model.bin"), os.path.join(model_dir, "golden.txt")
-    tb = os.path.join(model_dir, "tokenizer.bin")
-    old = open(gt).read().split("\n")
-    ids = [int(t) for t in old[0].split()]
-    prev = [int(t) for t in old[1].split()] if len(old) > 1 else []
-    gen = Ref(mb).greedy(ids, n_tokens)[len(ids):]
+def golden_name(act: str) -> str:
+    return "golden.txt" if act == "f32" else f"golden_{act}.txt"
+
+
+def regolden(model_dir: str, n_tokens: int, act: str = "f32"):
+    """Rewrite MODEL_DIR/golden.txt (act f32) or golden_i8.txt (act i8) from an existing
+    model.bin with the current reference. Takes the prompt ids from golden.txt, so neither
+    torch nor tokenizers is needed. For i8 it also compares against the float golden."""
+    mb, tb = os.path.join(model_dir, "model.bin"), os.path.join(model_dir, "tokenizer.bin")
+    base = open(os.path.join(model_dir, "golden.txt")).read().split("\n")
+    ids = [int(t) for t in base[0].split()]
+    out = os.path.join(model_dir, golden_name(act))
+    prev = []
+    if os.path.exists(out):
+        old = open(out).read().split("\n")
+        prev = [int(t) for t in old[1].split()] if len(old) > 1 else []
+    gen = Ref(mb, act).greedy(ids, n_tokens)[len(ids):]
     if os.path.exists(tb):
-        print("greedy (int4 reference, int8 KV):", decode_bin(tb, ids + gen))
+        print(f"greedy (int4 weights, {act} activations, int8 KV):", decode_bin(tb, ids + gen))
     changed = sum(1 for x, y in zip(prev, gen) if x != y)
-    with open(gt, "w", newline="\n") as fh:
+    with open(out, "w", newline="\n") as fh:
         fh.write(" ".join(map(str, ids)) + "\n" + " ".join(map(str, gen)) + "\n")
-    print(f"{gt}: {len(ids)} prompt + {len(gen)} tokens, "
-          f"{changed} of {min(len(prev), len(gen))} differ from the old golden")
+    print(f"{out}: {len(ids)} prompt + {len(gen)} tokens, "
+          f"{changed} of {min(len(prev), len(gen))} differ from the previous {golden_name(act)}")
+    if act != "f32":
+        f = [int(t) for t in base[1].split()]
+        first = next((i for i, (x, y) in enumerate(zip(f, gen)) if x != y), None)
+        print(f"vs float golden: {sum(1 for x, y in zip(f, gen) if x == y)} of {min(len(f), len(gen))} "
+              f"tokens equal, first divergence at {'none' if first is None else first}")
 
 
 # ---------------------------------------------------------------- main
@@ -251,10 +338,12 @@ def main():
     ap.add_argument("--golden_tokens", type=int, default=48)
     ap.add_argument("--regolden", metavar="MODEL_DIR",
                     help="only rewrite MODEL_DIR/golden.txt from MODEL_DIR/model.bin (numpy only)")
+    ap.add_argument("--act", choices=("f32", "i8"), default="f32",
+                    help="with --regolden: f32 -> golden.txt, i8 -> golden_i8.txt (int8 activations)")
     a = ap.parse_args()
 
     if a.regolden:
-        regolden(a.regolden, a.golden_tokens)
+        regolden(a.regolden, a.golden_tokens, a.act)
         return
 
     import torch
@@ -275,6 +364,12 @@ def main():
         with open("golden.txt", "w") as fh:
             fh.write(" ".join(map(str, ids)) + "\n" + " ".join(map(str, gen[len(ids):])) + "\n")
         print(f"golden.txt: {len(ids)} prompt tokens + {a.golden_tokens} greedy tokens")
+        gen8 = Ref(a.out, "i8").greedy(ids, a.golden_tokens)
+        with open("golden_i8.txt", "w") as fh:
+            fh.write(" ".join(map(str, ids)) + "\n" + " ".join(map(str, gen8[len(ids):])) + "\n")
+        print("greedy (int8 activations):", tk.decode(gen8))
+        print(f"golden_i8.txt: {sum(1 for x, y in zip(gen[len(ids):], gen8[len(ids):]) if x == y)} "
+              f"of {a.golden_tokens} tokens equal to the float golden")
 
 
 if __name__ == "__main__":

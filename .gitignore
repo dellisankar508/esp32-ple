@@ -36,8 +36,10 @@ platform/esp32/managed_components/
 
 # ---------------------------------------------------------------- host build
 host/ple_host
-host/ple_host_tsan
+host/ple_host_*
+host/kern_test_*
 host/synthetic/
+tools/qemu_count/*.so
 
 # ---------------------------------------------------------------- python
 __pycache__/

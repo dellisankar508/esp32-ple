@@ -1,6 +1,7 @@
-// Pico 2 W (RP2350, 2x Cortex-M33 @ 150 MHz): scalar Arm baseline.
-// Boot: wait for USB serial, then run the shared benchmark (core/bench.c), the
-// same sequence the ESP32 runs, plus the DMA-streamed head (dma_head.c).
+// Pico 2 W (RP2350, 2x Cortex-M33 @ 150 MHz).
+// Boot: wait for USB serial, then (int8 kernels) check the kernel against the numpy
+// test vectors bit for bit, then run the shared benchmark (core/bench.c), the same
+// sequence the ESP32 runs, plus the DMA-streamed head (dma_head.c).
 // After that: Enter = sampled story, 'b' = rerun, 'd' = DMA head on/off.
 #include <stdio.h>
 #include <string.h>
@@ -15,6 +16,7 @@
 #include "kern.h"
 #include "head_stream.h"
 #include "dma_head.h"
+#include "kern_check.h"
 
 #define CTX 128
 #ifndef PLE_CFLAGS
@@ -24,6 +26,9 @@
 extern const uint8_t ple_model_start[], ple_model_end[];
 extern const uint8_t ple_tok_start[], ple_tok_end[];
 extern const char    ple_golden_start[];
+#if PLE_KERNEL_I8
+extern const uint8_t ple_kvec_start[], ple_kvec_end[];
+#endif
 
 // ------------------------------------------------------------ arena (never freed)
 static uint8_t arena[272 * 1024] __attribute__((aligned(16)));
@@ -115,12 +120,20 @@ int main(void) {
     if (tokenizer_load(&tk, ple_tok_start, (size_t)(ple_tok_end - ple_tok_start), arena_alloc)) {
         printf("tokenizer load failed\n"); for (;;) sleep_ms(1000);
     }
+#if PLE_KERNEL_I8
+    {   // kernel bit-exactness on the chip, in arena space the state has not claimed yet
+        size_t off = (arena_used + 15) & ~(size_t)15, need = 2 * sizeof(float) * m.V;
+        if (off + need > sizeof arena) printf("KERNEL | no room to check (%u B)\n", (unsigned)need);
+        else kern_check(ple_model_start, msize, ple_kvec_start,
+                        (size_t)(ple_kvec_end - ple_kvec_start), (float *)(arena + off));
+    }
+#endif
     if (ple_state_init(&s, &m, CTX, arena_alloc)) {
         printf("state alloc failed: need %u B, arena %u B\n",
                (unsigned)ple_state_bytes(&m, CTX), (unsigned)sizeof arena);
         for (;;) sleep_ms(1000);
     }
-    if (bench_parse_golden(ple_golden_start, &golden)) { printf("bad golden.txt\n"); for (;;) sleep_ms(1000); }
+    if (bench_parse_golden(ple_golden_start, &golden)) { printf("bad golden file\n"); for (;;) sleep_ms(1000); }
     printf("model V=%u D=%u L=%u H=%u F=%u P=%u | state %u B at ctx %d | arena %u/%u B | %u B/token\n",
            (unsigned)m.V, (unsigned)m.D, (unsigned)m.L, (unsigned)m.H, (unsigned)m.F, (unsigned)m.P,
            (unsigned)ple_state_bytes(&m, CTX), CTX, (unsigned)arena_used, (unsigned)sizeof arena,
