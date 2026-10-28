@@ -4,15 +4,17 @@ On a Raspberry Pi Pico 2 W, the int8 DSP kernel takes the model from **12.9 to 1
 tokens per second** (77.7 to 51.9 ms per token), and the chip itself checks the kernel
 against numpy **bit for bit**. Running the flash at 75 MHz, the Pico SDK's own setting
 for this board, takes it to **25.0 tokens per second (40.1 ms)**. At 150 MHz the Pico
-is now 1.57x faster than the 240 MHz ESP32 (63.0 ms per token, float kernel). On an emulated Cortex-M55, the Helium kernel
-runs a token in **1.26M instructions, 7.7x fewer than the float kernel**, and every
-logit of a 51-token decode has the same bits as a plain C reference. Quantizing the
-activations to int8, which is what makes this possible, costs almost nothing in
-quality.
+is now 1.57x faster than the 240 MHz ESP32 (63.0 ms per token, float kernel).
 
-Times come from the Pico. The instruction counts come from QEMU (`mps3-an547` for
-the M55, `mps2-an505` for the M33): they are exact, and they compare kernels, but
-they are not timings. Arm's Corstone-300 FVP is next.
+On a simulated Cortex-M55, the Helium kernel runs a token in **1.26M instructions,
+7.7x fewer than the float kernel**, and every logit of a 51-token decode has the same
+bits as a plain C reference. Arm's own Corstone-300 FVP and QEMU agree on every one
+of those bits. Quantizing the activations to int8, which is what makes this
+possible, costs almost nothing in quality.
+
+Times come from the Pico. Instruction counts come from QEMU (`mps3-an547` for the
+M55, `mps2-an505` for the M33) and Arm's Corstone-300 FVP, which agree to within a
+few instructions. They compare kernels; they are not timings.
 
 ## Why int8 activations
 
@@ -118,7 +120,7 @@ and an odd column.
   fixing the encoding of exactly this instruction. The kernel converts the scales
   with the scalar instruction instead, which every toolchain gets right.
 
-## Results (QEMU instruction counts)
+## Results: instruction counts
 
 | Core | Kernel | Instructions / token | In the kernel | Output head (8192 x 96) |
 | --- | --- | --- | --- | --- |
@@ -136,8 +138,32 @@ The next bottleneck is outside the kernels. With Helium, a third of each token's
 instructions are now attention, softmax and the norms: 0.43M, and attention grows
 with the context.
 
-Neither emulator models timing. QEMU and the FVP execute instructions, not cycles,
-and the Cortex-M55 runs most 128-bit Helium instructions over two cycles,
+### On Arm's Corstone-300 FVP
+
+The same two ELFs (`mve` and `i8ref`), run on Arm's Fixed Virtual Platform for the
+Corstone-300 (version 11.27), give the same answer as in QEMU:
+
+| Check | `mve` (Helium) | `i8ref` (plain C) |
+| --- | --- | --- |
+| Kernel vs numpy | BITEXACT 42/42 | BITEXACT 42/42 |
+| Golden decode | MATCH | MATCH |
+| Hash of all 51 x 8192 logits | `0xe5f66a1b` | `0xe5f66a1b` |
+| Output head, FVP cycle counter | 463,283 | 4,950,400 |
+| Output head, QEMU instructions | 463,277 | 4,950,394 |
+| Whole run, FVP instructions | 92.8M | 524.8M |
+
+- **Two independent models of the Cortex-M55 agree on every bit.** QEMU and Arm's
+  Fast Model implement the core separately, and both print the same hash over every
+  logit of the run, for both kernels.
+- **The FVP's cycle counter counts one per instruction.** The FVP is not
+  cycle-accurate, so its cycle count equals the instruction count. It matches QEMU's
+  count for the output head to within 6 instructions; the difference is the
+  measurement code around the region.
+- **The whole run** includes the kernel check and hashing the logits. Helium runs it
+  in 5.7x fewer instructions than the plain C kernel.
+
+Neither QEMU nor the FVP models timing. They execute instructions, not cycles, and
+the Cortex-M55 runs most 128-bit Helium instructions over two cycles,
 overlapping neighbours ("beats"). On real boards the weights also stream from
 flash, so a faster kernel moves the bottleneck towards flash. The Pico shows how
 much.
@@ -210,8 +236,8 @@ What it shows:
    they do in the head, and core 1, idle during the layers, can take half the maths.
    Estimate: 25 to 30 ms per token, 33 to 40 tokens/s. The floor for the whole token
    at the DMA's rate is 23.5 ms.
-2. **Corstone-300 FVP** (`make fvp KERNEL=mve` and `KERNEL=i8ref`). The same checks
-   on Arm's reference model, plus the M55's PMU counts: instructions, Helium
-   instructions and cycles.
-3. **int8 attention.** Quantize q per head and use SMLAD (M33) or VMLADAV (Helium)
+2. **int8 attention.** Quantize q per head and use SMLAD (M33) or VMLADAV (Helium)
    against the int8 K cache, which already has the right format.
+3. **Cycles on real Helium silicon.** Instruction counts can't show how the M55
+   overlaps Helium instructions. A Cortex-M55 or M85 board would, for example the
+   Himax WiseEye2 on Seeed's Grove Vision AI V2 or the Renesas RA8M1.

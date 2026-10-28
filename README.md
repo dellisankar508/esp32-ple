@@ -9,7 +9,7 @@ token for token.
 | --- | --- | --- |
 | ESP32-D0WD | Xtensa LX6, 2x 240 MHz, no PSRAM, no SIMD | 63.0 ms/token, 15.9 tok/s, golden MATCH |
 | Raspberry Pi Pico 2 W | Arm Cortex-M33, 2x 150 MHz | **40.1 ms/token, 25.0 tok/s**: int8 DSP kernel, DMA-streamed head, flash at 75 MHz (v0.1.0 float kernel: 77.7 ms, 12.9 tok/s); kernel bit-exact on the chip, golden MATCH |
-| Corstone-300 (Cortex-M55 + Helium) | simulated: QEMU `mps3-an547` now, Arm's FVP next | int8 Helium kernel bit-exact; 1.26M instructions per token, 7.7x fewer than the float kernel (QEMU counts, not timings) |
+| Corstone-300 (Cortex-M55 + Helium) | simulated: Arm's Corstone-300 FVP and QEMU `mps3-an547` | int8 Helium kernel bit-exact on both, same logits hash; 1.26M instructions per token, 7.7x fewer than the float kernel (instruction counts, not timings) |
 
 **How it fits:**
 
@@ -175,7 +175,8 @@ Output goes through semihosting. Each run prints:
 - `LOGITS`: a hash of every logit of that decode. Two kernels with the same hash on
   the same core produced a bit-identical run of the whole model.
 - `PMU` (FVP): instructions, Helium instructions and cycles per token, from the
-  Cortex-M55's performance monitor
+  Cortex-M55's performance monitor. The FVP isn't cycle-accurate: its cycle counter
+  advances one per instruction.
 
 ```
 cd platform/corstone300
@@ -188,10 +189,14 @@ make qemu KERNEL=dsp BOARD=an505   # the Pico's M33 kernel, on QEMU's Cortex-M33
 
 Needs `arm-none-eabi-gcc` 13 or newer with newlib. Get the FVP from Arm's
 [Ecosystem FVPs](https://developer.arm.com/downloads/-/arm-ecosystem-fvps) page
-(Corstone-300, Linux; it runs in WSL). The FVP and QEMU are not cycle-accurate, so
+(Corstone-300, Linux; it runs in WSL). Version 11.27 needs Python 3.9's shared
+library (`libpython3.9.so.1.0`): if it's missing, use the one in the FVP's own
+`python/lib` folder through `LD_LIBRARY_PATH`, or install `libpython3.9`. The FVP and QEMU are not cycle-accurate, so
 their numbers compare kernels by instructions; they are not timings.
 
-Instructions per token in QEMU (51-token golden decode, 4.4M-parameter model):
+Instructions per token in QEMU (51-token golden decode, 4.4M-parameter model). Arm's
+FVP prints the same logits hash for `mve` and `i8ref` (`0xe5f66a1b`) and the same
+instruction count for the output head, to within 6 instructions:
 
 | Core | Kernel | Instructions / token | In the kernel | Golden |
 | --- | --- | --- | --- | --- |

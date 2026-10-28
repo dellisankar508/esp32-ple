@@ -68,7 +68,7 @@ count: $(ELF)
 
 # Corstone-300 FVP, no visualisation or telnet; --stat prints the instructions simulated.
 fvp: $(ELF)
-	$(FVP) -a $(ELF) --stat \
+	$(FVP) -a $(ELF) --stat --timelimit 600 \
 	    -C mps3_board.visualisation.disable-visualisation=1 \
 	    -C mps3_board.telnetterminal0.start_telnet=0 \
 	    -C mps3_board.uart0.out_file=- \

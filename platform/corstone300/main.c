@@ -39,6 +39,10 @@ __attribute__((noinline)) void ple_mark_head_begin(void) { __asm volatile("" :::
 __attribute__((noinline)) void ple_mark_head_end(void)   { __asm volatile("" ::: "memory"); }
 
 // ---------------------------------------------------------------- PMU (Armv8.1-M)
+// Event counters are 16 bits wide on the Cortex-M55, so each count uses a pair: the
+// even counter counts the event and the odd one, set to CHAIN, counts its overflows.
+// The cycle counter is 32 bits. On the FVP the cycle counter advances one per
+// instruction (the model is not cycle-accurate); on silicon it counts real cycles.
 #if PLE_PMU
 #define REG(a) (*(volatile uint32_t *)(a))
 #define DEMCR          REG(0xE000EDFC)
@@ -48,16 +52,26 @@ __attribute__((noinline)) void ple_mark_head_end(void)   { __asm volatile("" :::
 #define PMU_CNTENSET   REG(0xE0003C00)
 #define PMU_CTRL       REG(0xE0003E04)
 #define EV_INST_RETIRED     0x0008
+#define EV_CHAIN            0x001E
 #define EV_MVE_INST_RETIRED 0x0200
 static void pmu_init(void) {
     DEMCR |= 1u << 24;                                   // TRCENA: PMU and DWT on
     PMU_EVTYPER(0) = EV_INST_RETIRED;
-    PMU_EVTYPER(1) = EV_MVE_INST_RETIRED;
-    PMU_CNTENSET = (1u << 31) | 3u;                      // cycle counter + counters 0, 1
+    PMU_EVTYPER(1) = EV_CHAIN;                           // counters 0+1: instructions
+    PMU_EVTYPER(2) = EV_MVE_INST_RETIRED;
+    PMU_EVTYPER(3) = EV_CHAIN;                           // counters 2+3: Helium instructions
+    PMU_CNTENSET = (1u << 31) | 0xFu;                    // cycle counter + counters 0..3
     PMU_CTRL = 1u | 2u | 4u;                             // enable, reset counters, reset cycles
 }
+// A chained pair as one 32-bit value; re-read if the high half moved in between.
+static uint32_t pmu_pair(int n) {
+    uint32_t hi, lo;
+    do { hi = PMU_EVCNTR(n + 1) & 0xFFFFu; lo = PMU_EVCNTR(n) & 0xFFFFu; }
+    while (hi != (PMU_EVCNTR(n + 1) & 0xFFFFu));
+    return hi << 16 | lo;
+}
 typedef struct { uint32_t inst, mve, cyc; } pmu_t;
-static pmu_t pmu_read(void) { pmu_t p = { PMU_EVCNTR(0), PMU_EVCNTR(1), PMU_CCNTR }; return p; }
+static pmu_t pmu_read(void) { pmu_t p = { pmu_pair(0), pmu_pair(2), PMU_CCNTR }; return p; }
 static pmu_t pmu_diff(pmu_t a, pmu_t b) { pmu_t d = { b.inst - a.inst, b.mve - a.mve, b.cyc - a.cyc }; return d; }
 #endif
 
@@ -135,7 +149,7 @@ int main(void) {
     ple_mark_head_end();
 #if PLE_PMU
     pmu_t hh = pmu_diff(h0, pmu_read());
-    if (!tt.inst) printf("PMU | not available on this target (QEMU: use make count)\n");
+    if (!tt.inst && !tt.cyc) printf("PMU | not available on this target (QEMU: use make count)\n");
     else printf("PMU | per token: %lu inst, %lu MVE inst, %lu cycles | head matvec %ux%u: %lu inst, %lu MVE inst, %lu cycles\n",
            (unsigned long)(tt.inst / (uint32_t)pos), (unsigned long)(tt.mve / (uint32_t)pos),
            (unsigned long)(tt.cyc / (uint32_t)pos), (unsigned)m.V, (unsigned)m.D,
